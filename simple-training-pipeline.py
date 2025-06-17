@@ -11,7 +11,7 @@ from kfp.dsl import (
 from kfp import kubernetes
 
 
-@component(base_image='python:3.9', packages_to_install=["dask[dataframe]==2024.8.0", "s3fs==2025.2.0", "pandas==2.2.3"])
+@component(base_image='python:3.9', packages_to_install=["openpyxl", "dask[dataframe]==2024.8.0", "s3fs==2025.2.0", "pandas==2.2.3"])
 def fetch_data(
     data_location: str,
     dataset: Output[Dataset],
@@ -35,6 +35,7 @@ def fetch_data(
 def train_model(
     data: Input[Dataset],
     trained_model: Output[Artifact],
+    metrics: Output[Metrics],
 ):
     """
     Trains a simple dense TensorFlow model using a single input dataset.
@@ -43,10 +44,10 @@ def train_model(
     import pandas as pd
     import tensorflow as tf
     from sklearn.model_selection import train_test_split
-    from keras.models import Sequential
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
     from keras.layers import Dense, Concatenate, Input as KerasInput
     from tensorflow.keras.models import Model as KerasModel
-    import subprocess
+    import numpy as np
 
     # Reproducibility
     SEED = 42
@@ -57,9 +58,6 @@ def train_model(
     # Load data
     df = pd.read_csv(data.path)
 
-    # Drop completely empty columns
-    df = df.dropna(axis=1, how='all')
-
     # Drop rows with missing Demand
     df = df.dropna(subset=["Demand"])
 
@@ -67,7 +65,7 @@ def train_model(
     y = df[["Demand"]]
     X = df.drop(columns=["Demand"])
 
-    # Convert non-numeric columns (e.g. Date)
+    # Convert non-numeric columns
     for col in X.columns:
         if not pd.api.types.is_numeric_dtype(X[col]):
             X[col] = pd.factorize(X[col])[0]
@@ -101,51 +99,67 @@ def train_model(
     )).batch(32)
 
     # Train the model
-    model.fit(train_dataset, validation_data=val_dataset, epochs=hyperparameters["epochs"], verbose=True)
+    model.fit(train_dataset, validation_data=val_dataset, epochs=1, verbose=True)
+
+    # Evaluate the model
+    val_inputs = {name: X_val[[name]].to_numpy() for name in X.columns}
+    y_pred = model.predict(val_inputs).flatten()
+    y_true = y_val.values.flatten()
+
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+
+    metrics.log_metric("MAE", float(mae))
+    metrics.log_metric("RMSE", float(rmse))
 
     # Save model
     model.save(trained_model.path + ".keras")
 
 @dsl.pipeline(
-  name='simple-training-model',
+  name='simple-training-pipeline',
 )
 def training_pipeline(data_location: str):
 
     fetch_task = fetch_data(data_location = data_location)
-    
 
+    train_model(data = fetch_task.outputs["dataset"])
 
 
 if __name__ == '__main__':
-    metadata = {
-        "data_location": 'https://raw.githubusercontent.com/RHRolun/simple-training-pipeline/main/data/demand_qty_item_loc.xlsx'
-    }
-        
-    namespace_file_path =\
-        '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
-    with open(namespace_file_path, 'r') as namespace_file:
-        namespace = namespace_file.read()
+    COMPILE=False
 
-    kubeflow_endpoint =\
-        f'https://ds-pipeline-dspa.{namespace}.svc:8443'
-
-    sa_token_file_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
-    with open(sa_token_file_path, 'r') as token_file:
-        bearer_token = token_file.read()
-
-    ssl_ca_cert =\
-        '/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt'
-
-    print(f'Connecting to Data Science Pipelines: {kubeflow_endpoint}')
-    client = kfp.Client(
-        host=kubeflow_endpoint,
-        existing_token=bearer_token,
-        ssl_ca_cert=ssl_ca_cert
-    )
-
-    client.create_run_from_pipeline_func(
-        training_pipeline,
-        arguments=metadata,
-        experiment_name="simple-training-model",
-        enable_caching=False
-    )
+    if COMPILE:
+        kfp.compiler.Compiler().compile(training_pipeline, 'simple-training-pipeline.yaml')
+    else:
+        metadata = {
+            "data_location": 'https://raw.githubusercontent.com/RHRolun/simple-training-pipeline/main/data/demand_qty_item_loc.xlsx'
+        }
+            
+        namespace_file_path =\
+            '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
+        with open(namespace_file_path, 'r') as namespace_file:
+            namespace = namespace_file.read()
+    
+        kubeflow_endpoint =\
+            f'https://ds-pipeline-dspa.{namespace}.svc:8443'
+    
+        sa_token_file_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+        with open(sa_token_file_path, 'r') as token_file:
+            bearer_token = token_file.read()
+    
+        ssl_ca_cert =\
+            '/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt'
+    
+        print(f'Connecting to Data Science Pipelines: {kubeflow_endpoint}')
+        client = kfp.Client(
+            host=kubeflow_endpoint,
+            existing_token=bearer_token,
+            ssl_ca_cert=ssl_ca_cert
+        )
+    
+        client.create_run_from_pipeline_func(
+            training_pipeline,
+            arguments=metadata,
+            experiment_name="simple-training-pipeline",
+            enable_caching=False
+        )

@@ -1,0 +1,174 @@
+# PIPELINE DEFINITION
+# Name: simple-training-pipeline
+# Inputs:
+#    data_location: str [Default: 'https://raw.githubusercontent.com/RHRolun/simple-training-pipeline/main/data/demand_qty_item_loc.xlsx']
+components:
+  comp-fetch-data:
+    executorLabel: exec-fetch-data
+    inputDefinitions:
+      parameters:
+        data_location:
+          parameterType: STRING
+    outputDefinitions:
+      artifacts:
+        dataset:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-train-model:
+    executorLabel: exec-train-model
+    inputDefinitions:
+      artifacts:
+        data:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        metrics:
+          artifactType:
+            schemaTitle: system.Metrics
+            schemaVersion: 0.0.1
+        trained_model:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+deploymentSpec:
+  executors:
+    exec-fetch-data:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - fetch_data
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.1'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'openpyxl' 'dask[dataframe]==2024.8.0'\
+          \ 's3fs==2025.2.0' 'pandas==2.2.3' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef fetch_data(\n    data_location: str,\n    dataset: Output[Dataset],\n\
+          ):\n    \"\"\"\n    Fetches data from URL\n    \"\"\"\n\n    import pandas\
+          \ as pd\n    import yaml\n    import os\n\n    data = pd.read_excel(data_location)\n\
+          \n    dataset.path += \".csv\"\n    dataset.metadata = {\"origin\": data_location}\n\
+          \    data.to_csv(dataset.path, index=False, header=True)\n\n"
+        image: python:3.9
+    exec-train-model:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - train_model
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.1'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'pandas==2.2.3'\
+          \ 'scikit-learn==1.6.1' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef train_model(\n    data: Input[Dataset],\n    trained_model: Output[Artifact],\n\
+          \    metrics: Output[Metrics],\n):\n    \"\"\"\n    Trains a simple dense\
+          \ TensorFlow model using a single input dataset.\n    Performs train/val\
+          \ splitting internally.\n    \"\"\"\n    import pandas as pd\n    import\
+          \ tensorflow as tf\n    from sklearn.model_selection import train_test_split\n\
+          \    from sklearn.metrics import mean_absolute_error, mean_squared_error\n\
+          \    from keras.layers import Dense, Concatenate, Input as KerasInput\n\
+          \    from tensorflow.keras.models import Model as KerasModel\n    import\
+          \ numpy as np\n\n    # Reproducibility\n    SEED = 42\n    tf.random.set_seed(SEED)\n\
+          \    tf.keras.utils.set_random_seed(SEED)\n    tf.config.experimental.enable_op_determinism()\n\
+          \n    # Load data\n    df = pd.read_csv(data.path)\n\n    # Drop rows with\
+          \ missing Demand\n    df = df.dropna(subset=[\"Demand\"])\n\n    # Separate\
+          \ features and label\n    y = df[[\"Demand\"]]\n    X = df.drop(columns=[\"\
+          Demand\"])\n\n    # Convert non-numeric columns\n    for col in X.columns:\n\
+          \        if not pd.api.types.is_numeric_dtype(X[col]):\n            X[col]\
+          \ = pd.factorize(X[col])[0]\n\n    # Train/val split\n    X_train, X_val,\
+          \ y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=SEED)\n\
+          \n    # Build model\n    inputs = [KerasInput(shape=(1,), name=name) for\
+          \ name in X.columns]\n    x = Concatenate(name=\"input\")(inputs)\n    x\
+          \ = Dense(64, activation='relu')(x)\n    x = Dense(128, activation='relu')(x)\n\
+          \    x = Dense(64, activation='relu')(x)\n    output = Dense(1)(x)\n\n \
+          \   model = KerasModel(inputs=inputs, outputs=output)\n    model.compile(optimizer='adam',\
+          \ loss='mse', metrics=['mae'])\n\n    # Prepare datasets\n    train_features\
+          \ = [X_train[[name]].to_numpy() for name in X.columns]\n    val_features\
+          \ = [X_val[[name]].to_numpy() for name in X.columns]\n\n    train_dataset\
+          \ = tf.data.Dataset.zip((\n        tf.data.Dataset.zip(tuple(tf.data.Dataset.from_tensor_slices(f)\
+          \ for f in train_features)),\n        tf.data.Dataset.from_tensor_slices(y_train)\n\
+          \    )).shuffle(len(y_train), seed=SEED).batch(32)\n\n    val_dataset =\
+          \ tf.data.Dataset.zip((\n        tf.data.Dataset.zip(tuple(tf.data.Dataset.from_tensor_slices(f)\
+          \ for f in val_features)),\n        tf.data.Dataset.from_tensor_slices(y_val)\n\
+          \    )).batch(32)\n\n    # Train the model\n    model.fit(train_dataset,\
+          \ validation_data=val_dataset, epochs=1, verbose=True)\n\n    # Evaluate\
+          \ the model\n    val_inputs = {name: X_val[[name]].to_numpy() for name in\
+          \ X.columns}\n    y_pred = model.predict(val_inputs).flatten()\n    y_true\
+          \ = y_val.values.flatten()\n\n    mae = mean_absolute_error(y_true, y_pred)\n\
+          \    rmse = np.sqrt(mean_squared_error(y_true, y_pred))\n\n    metrics.log_metric(\"\
+          MAE\", float(mae))\n    metrics.log_metric(\"RMSE\", float(rmse))\n\n  \
+          \  # Save model\n    model.save(trained_model.path + \".keras\")\n\n"
+        image: tensorflow/tensorflow:2.15.0
+pipelineInfo:
+  name: simple-training-pipeline
+root:
+  dag:
+    tasks:
+      fetch-data:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-fetch-data
+        inputs:
+          parameters:
+            data_location:
+              componentInputParameter: data_location
+        taskInfo:
+          name: fetch-data
+      train-model:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-train-model
+        dependentTasks:
+        - fetch-data
+        inputs:
+          artifacts:
+            data:
+              taskOutputArtifact:
+                outputArtifactKey: dataset
+                producerTask: fetch-data
+        taskInfo:
+          name: train-model
+  inputDefinitions:
+    parameters:
+      data_location:
+        defaultValue: https://raw.githubusercontent.com/RHRolun/simple-training-pipeline/main/data/demand_qty_item_loc.xlsx
+        parameterType: STRING
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.12.1
